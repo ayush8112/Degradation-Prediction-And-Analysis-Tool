@@ -1,371 +1,376 @@
-# Required Packages:
-# To run this script, you need to install the following libraries.
-# Open your terminal or command prompt and run these commands:
-# pip install pandas
-# pip install matplotlib
-# pip install scikit-learn
-# pip install openpyxl
-# pip install scipy
+# Required packages: pandas, matplotlib, scikit-learn, openpyxl, scipy, numpy
+# Install them with: pip install -r requirements.txt
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
 import os
-from sklearn.metrics import r2_score, mean_squared_error
+import traceback
 import warnings
-warnings.filterwarnings('ignore')
 
-# Set global font to Times New Roman
-plt.rcParams['font.family'] = 'serif'
-plt.rcParams['font.serif'] = ['Times New Roman'] + plt.rcParams['font.serif']
+import matplotlib
+matplotlib.use('Agg')  # figures are only written to files, never shown
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.ticker import MaxNLocator
+from scipy.optimize import OptimizeWarning, curve_fit
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Plot text: Times New Roman, black, sizes 16 (titles), 14 (axis labels), 12 (everything else)
+plt.rcParams.update({
+    'font.family': 'serif', 'font.serif': ['Times New Roman'] + plt.rcParams['font.serif'],
+
+    'text.color': 'black', 'axes.labelcolor': 'black', 'axes.titlecolor': 'black',
+    'xtick.color': 'black', 'ytick.color': 'black',
+    'font.size': 12, 'axes.titlesize': 16, 'axes.labelsize': 14, 'axes.labelweight': 'bold',
+    'xtick.labelsize': 12, 'ytick.labelsize': 12, 'legend.fontsize': 12,
+})
+
+THRESHOLD = 50.0   # degradation level (%) whose crossing time is reported
+EPS = 1e-9         # floor that keeps log and power functions defined at x = 0
+MAX_EXP = 50.0     # exponent clip so exp() cannot overflow
+RULE = '=' * 60
+
+
+# Model functions. The same function is used to fit, to predict and to plot, with no shifted x.
+def _linear(x, m, c): return m * x + c
+def _logarithmic(x, a, b, c): return a * np.log(np.maximum(x + b, EPS)) + c
+def _power_law(x, a, b, c): return a * np.power(np.maximum(x, EPS), b) + c
+def _exponential(x, a, b, c): return a * np.exp(np.clip(b * x, -MAX_EXP, MAX_EXP)) + c
+
+
+# name: (function, equation for the plot, line colour)
+MODELS = {
+    'Linear': (_linear, 'y = m·x + c', 'blue'),
+    'Logarithmic': (_logarithmic, 'y = a·ln(x + b) + c', 'green'),
+    'Power Law': (_power_law, 'y = a·x^b + c', 'purple'),
+    'Exponential': (_exponential, 'y = a·exp(b·x) + c', 'brown'),
+}
+
+
+def _fit_model(x, y, name):
+    """Fit one model from several starting points. Returns (params, metrics) or (None, None)."""
+    func = MODELS[name][0]
+    span, rng = max(x.max() - x.min(), EPS), max(y.max() - y.min(), EPS)
+    slope, y0 = (y[-1] - y[0]) / span, y[0]
+    a_exp = rng / np.expm1(2)
+    starts = {
+        'Linear': [[slope, y0], [0.1, 0.0]],
+        'Logarithmic': [[rng, 1.0, y.min()], [10.0, 1.0, 0.0]],
+        'Power Law': [[slope, 1.0, y0], [1.0, 0.5, 0.0]],
+        # first guess is anchored at the first x so b * x stays small when time does not start at 0
+        'Exponential': [[a_exp * np.exp(-2.0 * x.min() / span), 2.0 / span, y0 - a_exp],
+                        [1.0, 0.01, y0]],
+    }[name]
+
+    best_params, best_metrics, best_r2 = None, None, -np.inf
+    for p0 in starts:
+        try:
+            with warnings.catch_warnings(), np.errstate(all='ignore'):
+                warnings.simplefilter('ignore', OptimizeWarning)
+                popt, _ = curve_fit(func, x, y, p0=p0, maxfev=10000)
+                pred = func(x, *popt)
+        except (RuntimeError, ValueError):  # no convergence or non-finite residuals
+            continue
+        if not np.isfinite(pred).all():
+            continue
+        r2 = r2_score(y, pred)
+        if r2 >= 0 and r2 > best_r2:
+            mse = mean_squared_error(y, pred)
+            best_params, best_r2 = popt, r2
+            best_metrics = {'r2': r2, 'mse': mse, 'rmse': np.sqrt(mse)}
+    return best_params, best_metrics
+
+
+def _days_to_threshold(days, pred, threshold=THRESHOLD):
+    """First day the curve reaches the threshold (linear interpolation), or NaN if it never does."""
+    hit = pred >= threshold
+    if not hit.any():
+        return np.nan
+    i = int(hit.argmax())
+    if i == 0:
+        return float(days[0])
+    return float(np.interp(threshold, pred[i - 1:i + 1], days[i - 1:i + 1]))
+
+
+def _fmt_days(info, nd=2):
+    if info is None:
+        return 'N/A'
+    return 'Not Reached' if np.isnan(info['days_to_50']) else f"{info['days_to_50']:.{nd}f}"
+
+
+def _fmt_metric(info, key):
+    return 'N/A' if info is None else f"{info['metrics'][key]:.4f}"
+
+
+def _safe(text, extra=''):
+    return ''.join(c for c in text if c.isalnum() or c in extra)
+
 
 class DegradationAnalysis:
-    """
-    A comprehensive and flexible class for analyzing and predicting material degradation
-    from multiple user-defined datasets using a user-selected set of models.
-    """
+    """Fits the selected models to every batch of every dataset, then plots, tabulates and reports."""
 
     def __init__(self, datasets_config, selected_models):
-        """
-        Initializes the analysis with dataset configurations and a list of selected models.
-        """
         if not datasets_config: raise ValueError("Dataset configuration cannot be empty.")
         if not selected_models: raise ValueError("A list of models to run must be provided.")
-            
+
         self.datasets_config = datasets_config
         self.selected_models = selected_models
-        
-        self.output_dir = os.path.dirname(self.datasets_config[0]['path']) or '.'
+        self.batches = ['Standard Batch (0%)', 'Neem, 25%', 'Eucalyptus, 25%', 'Moringa, 25%']
+        self.dataframes, self.all_models = {}, {}
+
+        self.output_dir = os.path.dirname(os.path.abspath(datasets_config[0]['path']))
         self.graphs_dir = os.path.join(self.output_dir, 'graphs')
         self.results_dir = os.path.join(self.output_dir, 'results')
         os.makedirs(self.graphs_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)
         print(f"\n✅ All outputs will be saved to '{self.graphs_dir}' and '{self.results_dir}'")
 
-        self.batches = ['Standard Batch (0%)', 'Neem, 25%', 'Eucalyptus, 25%', 'Moringa, 25%']
-        
-        self.dataframes = {}
-        self.all_models = {}
-
-    # --- MODEL FUNCTIONS ---
-    def _logarithmic_func(self, x, a, b, c): return a * np.log(np.maximum(x + b, 1e-6)) + c
-    def _linear_func(self, x, m, c): return m * x + c
-    def _power_law_func(self, x, a, b, c): return a * np.power(x, b) + c
-    def _exponential_func(self, x, a, b, c): return a * np.exp(np.clip(b * x, -np.inf, 100)) + c
-
     def _preprocess_data(self, file_path):
-        print(f"\nPreprocessing data from '{os.path.basename(file_path)}'...")
+        base = os.path.basename(file_path)
+        print(f"\nPreprocessing data from '{base}'...")
         try:
-            df = pd.read_excel(file_path, sheet_name='t-DR')
-        except ValueError:
-            try:
-                xl_file = pd.ExcelFile(file_path)
-                df = pd.read_excel(file_path, sheet_name=xl_file.sheet_names[0])
-            except Exception as e:
-                raise IOError(f"Could not read the Excel file '{file_path}'. Error: {e}")
-        
-        df.columns = df.columns.str.strip()
-        time_data = None
-        for col in ['Day', 'Days', 'Time', 'Hours', 'day', 'days', 'time', 'hours']:
-            if col in df.columns:
-                df = df.dropna(subset=[col])
-                time_data = (pd.to_numeric(df[col], errors='coerce').values / 24) if 'hour' in col.lower() else pd.to_numeric(df[col], errors='coerce').values
-                break
-        if time_data is None: raise KeyError(f"Could not find a valid time column (e.g., 'Day') in {os.path.basename(file_path)}.")
-        
-        processed_data = {'Day': time_data}
+            with pd.ExcelFile(file_path) as xl:
+                df = xl.parse('t-DR' if 't-DR' in xl.sheet_names else xl.sheet_names[0])
+        except Exception as e:
+            raise OSError(f"Could not read the Excel file '{file_path}'. Error: {e}") from e
+
+        df.columns = df.columns.astype(str).str.strip()
+        lower = {c.lower(): c for c in df.columns}
+        tcol = next((lower[k] for k in ('day', 'days', 'time', 'hours') if k in lower), None)
+        if tcol is None:
+            raise ValueError(f"Could not find a time column (Day, Days, Time or Hours) in {base}.")
+
+        raw = pd.DataFrame({'Day': pd.to_numeric(df[tcol], errors='coerce') / (24 if 'hour' in tcol.lower() else 1)})
         for batch in self.batches:
             if batch in df.columns:
-                processed_data[f"{batch}_degradation"] = np.maximum(pd.to_numeric(df[batch], errors='coerce').interpolate(method='linear').values, 0)
-        
-        processed_df = pd.DataFrame(processed_data).dropna()
-        if len(processed_df) < 3: raise ValueError(f"Insufficient data points (<3) in {os.path.basename(file_path)}.")
-        
-        output_path = os.path.join(self.results_dir, f'{os.path.basename(file_path).split(".")[0].lower()}_processed.csv')
-        processed_df.to_csv(output_path, index=False)
-        print(f"Successfully processed {len(processed_data)-1} batches. Saved to {output_path}")
-        return processed_df
+                raw[f'{batch}_degradation'] = pd.to_numeric(df[batch], errors='coerce').clip(lower=0)
+        if raw.shape[1] == 1:
+            raise ValueError(f"None of the expected batch columns were found in {base}.")
 
-    def _fit_model_with_fallbacks(self, x_data, y_data, model_func, model_name):
-        finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
-        x_clean, y_clean = x_data[finite_mask], y_data[finite_mask]
-        if len(x_clean) < 3: return None, None
-        
-        param_strategies, slope_est = [], (y_clean[-1] - y_clean[0]) / (x_clean[-1] - x_clean[0]) if x_clean[-1] != x_clean[0] else 0
+        # Rows are sorted by time and every reading is kept. Gaps inside a series are filled by
+        # linear interpolation on the Day values (uneven spacing is respected); leading and
+        # trailing gaps stay empty so no data is invented at the edges.
+        df = raw.dropna(subset=['Day']).sort_values('Day', kind='stable').reset_index(drop=True)
+        for col in df.columns[1:]:
+            ok = df[col].notna()
+            if ok.any():
+                gap = ~ok & df['Day'].between(df.loc[ok, 'Day'].iloc[0], df.loc[ok, 'Day'].iloc[-1])
+                df.loc[gap, col] = np.interp(df.loc[gap, 'Day'], df.loc[ok, 'Day'], df.loc[ok, col])
+        if len(df) < 3:
+            raise ValueError(f"Insufficient data points (<3) in {base}.")
 
-        if model_name.lower() == 'linear': param_strategies = [[slope_est, y_clean[0]], [0.1, 0]]
-        elif model_name.lower() == 'logarithmic': param_strategies = [[y_clean.max() - y_clean.min(), 1, y_clean.min()], [10, 1, 0]]
-        elif model_name.lower() == 'power law': param_strategies = [[slope_est, 1, y_clean[0]], [1, 0.5, 0]]
-        elif model_name.lower() == 'exponential': param_strategies = [[1.0, 0.01, y_clean[0]], [0.1, 0.01, 0]]
+        out = os.path.join(self.results_dir, f'{os.path.splitext(base)[0].lower()}_processed.csv')
+        df.to_csv(out, index=False)
+        print(f"Successfully processed {raw.shape[1] - 1} batches. Saved to {out}")
+        return df
 
-        best_params, best_metrics = None, {"r2": -np.inf}
-        for params in param_strategies:
-            try:
-                popt, _ = curve_fit(model_func, x_clean + 1e-9, y_clean, p0=params, maxfev=10000)
-                y_pred = model_func(x_clean + 1e-9, *popt)
-                if not np.all(np.isfinite(y_pred)): continue
-                r2 = r2_score(y_clean, y_pred)
-                if r2 > best_metrics["r2"] and r2 >= 0:
-                    best_params, mse = popt, mean_squared_error(y_clean, y_pred)
-                    best_metrics = {"r2": r2, "mse": mse, "rmse": np.sqrt(mse)}
-            except Exception: continue
-        return best_params, best_metrics if best_params is not None else None
+    def _create_models_for_dataset(self, info):
+        name, path = info['name'], info['path']
+        df = self._preprocess_data(path)
+        self.dataframes[name] = df
+        models = self.all_models.setdefault(name, {})
+        grid = np.linspace(0, max(2000.0, 1.25 * df['Day'].max() + 5), 4000)  # day 2000 as in the original, longer only if the data needs it
 
-    def _create_models_for_dataset(self, dataset_info):
-        dataset_name, file_path = dataset_info['name'], dataset_info['path']
-        df = self._preprocess_data(file_path)
-        self.dataframes[dataset_name] = df
-        
-        models_for_dataset = self.all_models.setdefault(dataset_name, {})
-
-        all_available_models = {
-            "Linear": self._linear_func, "Logarithmic": self._logarithmic_func,
-            "Power Law": self._power_law_func, "Exponential": self._exponential_func
-        }
-        models_to_fit = {name: func for name, func in all_available_models.items() if name in self.selected_models}
-
-        days_for_prediction = np.linspace(0, 2000, 4000) 
-        
-        print(f"\n{'='*60}\nCreating Models for '{dataset_name}'\n{'='*60}")
+        print(f"\n{RULE}\nCreating models for '{name}'\n{RULE}")
         for batch in self.batches:
-            col = f"{batch}_degradation"
+            col = f'{batch}_degradation'
             if col not in df.columns: continue
-            print(f"\n--- Processing {batch} ---")
-            days_actual, degradation_actual = df["Day"].values, df[col].values
-            
-            if len(days_actual) < 3 or np.all(degradation_actual == degradation_actual[0]):
-                print("No variation in data or insufficient points."); continue
-            
-            models_for_dataset[batch] = {}
-            best_model_name, best_r2_val = None, -np.inf
-            for name, func in models_to_fit.items():
-                params, metrics = self._fit_model_with_fallbacks(days_actual, degradation_actual, func, name)
-                if params is None: print(f"    Failed to fit {name} model."); continue
-                
-                print(f"    {name}: R²={metrics['r2']:.4f}, MSE={metrics['mse']:.4f}, RMSE={metrics['rmse']:.4f}")
-                pred = func(days_for_prediction + 1e-9, *params)
-                days_to_50 = self._find_days_to_threshold(days_for_prediction, pred, 50)
-                models_for_dataset[batch][name] = {"params": params, "metrics": metrics, "days_to_50": days_to_50}
-                if metrics['r2'] > best_r2_val: best_r2_val, best_model_name = metrics['r2'], name
-                self._create_individual_plot(days_actual, degradation_actual, days_for_prediction, pred, batch, dataset_name, name, metrics, days_to_50)
-            if best_model_name: print(f"  Best model for {batch}: {best_model_name} (R² = {best_r2_val:.4f})")
+            print(f"\nProcessing {batch}")
+            sub = df[['Day', col]].dropna()  # each batch uses only its own valid rows
+            x, y = sub['Day'].to_numpy(), sub[col].to_numpy()
+            if len(x) < 3 or np.ptp(y) == 0:
+                print("    Skipped: fewer than 3 points or no variation."); continue
 
-    def _find_days_to_threshold(self, days, degradation, threshold):
-        indices = np.where(degradation >= threshold)[0]
-        if len(indices) == 0: return "Not Reached"
-        idx = indices[0]
-        if idx == 0: return days[0]
-        x1, y1, x2, y2 = days[idx-1], degradation[idx-1], days[idx], degradation[idx]
-        return x1 + (x2 - x1) * (threshold - y1) / (y2 - y1) if y2 != y1 else days[idx]
+            models[batch] = {}
+            for model in self.selected_models:
+                params, metrics = _fit_model(x, y, model)
+                if params is None:
+                    print(f"    Failed to fit {model} model."); continue
+                with np.errstate(all='ignore'):  # a huge fitted exponent may overflow far out; the check below reports it
+                    pred = MODELS[model][0](grid, *params)
+                if not np.isfinite(pred).all():
+                    print(f"    {model}: extrapolation is not finite, skipped."); continue
+                d50 = _days_to_threshold(grid, pred)
+                print(f"    {model}: R²={metrics['r2']:.4f}, MSE={metrics['mse']:.4f}, RMSE={metrics['rmse']:.4f}")
+                models[batch][model] = {'params': params, 'metrics': metrics, 'days_to_50': d50}
+                self._plot_fit(x, y, grid, pred, batch, name, model, metrics, d50)
 
-    def _get_equation_text(self, model_name, metrics):
-        eq_map = {
-            'linear': r'$y = mx + c$', 'logarithmic': r'$y = a \cdot \ln(x + b) + c$',
-            'power law': r'$y = a \cdot x^b + c$', 'exponential': r'$y = a \cdot e^{bx} + c$'
-        }
-        eq = eq_map.get(model_name.lower(), 'Unknown Model')
-        return f"Model: {eq}\n$R^2$   = {metrics['r2']:.4f}\nRMSE = {metrics['rmse']:.4f}"
+            fitted = models[batch]
+            if fitted:
+                best = max(fitted, key=lambda m: fitted[m]['metrics']['r2'])
+                print(f"  Best model for {batch}: {best} (R² = {fitted[best]['metrics']['r2']:.4f})")
 
-    def _create_individual_plot(self, days_actual, degradation_actual, days_for_prediction, degradation_predicted, batch, dataset_name, model_name, metrics, days_to_50):
-        plt.figure(figsize=(12, 8)); ax = plt.gca()
-        if isinstance(days_to_50, float): x_axis_limit = np.ceil(days_to_50 / 5) * 5
-        else: x_axis_limit = np.ceil((days_actual.max() * 1.25) / 5) * 5
-        
-        limit_idx = np.searchsorted(days_for_prediction, x_axis_limit)
-        days_plot, pred_plot = days_for_prediction[:limit_idx+1], degradation_predicted[:limit_idx+1]
-        
-        ax.scatter(days_actual, degradation_actual, color="red", s=50, label="Actual Data", zorder=5)
-        color_map = {'Linear': 'blue', 'Logarithmic': 'green', 'Power Law': 'purple', 'Exponential': 'brown'}
-        color = color_map.get(model_name, 'black')
-        
-        max_actual_day = days_actual.max()
-        split_idx = np.searchsorted(days_plot, max_actual_day)
-        
-        ax.plot(days_plot[:split_idx+1], pred_plot[:split_idx+1], color=color, linewidth=2.5, label=f"{model_name} Model ($R^2$ = {metrics['r2']:.4f})")
-        ax.plot(days_plot[split_idx:], pred_plot[split_idx:], color=color, linewidth=2.5, linestyle='--')
-        ax.axvline(x=max_actual_day, color='gray', linestyle=':', linewidth=2, label=f'End of Actual Data ({max_actual_day:.0f} days)')
-        ax.axhline(y=50, color="black", linestyle="--", alpha=0.7, label="50% Degradation Threshold")
-        
-        if isinstance(days_to_50, float) and days_to_50 <= x_axis_limit:
-            ax.axvline(x=days_to_50, color="orange", linestyle=":", alpha=0.8)
-            ax.text(days_to_50 * 1.02, 45, f"{days_to_50:.1f} days", color="orange", fontweight='bold', rotation=90)
-        
-        ax.set(title=f"{batch} - {dataset_name}\n{model_name} Model Extrapolation", xlabel="Time (Days)", ylabel="Degradation (%)", ylim=(0, 105), xlim=(0, x_axis_limit))
-        ax.legend(fontsize=10)
-        
-        final_ticks = None
-        for num_intervals in range(8, 3, -1):
-            if x_axis_limit > 0 and x_axis_limit % num_intervals == 0:
-                interval = x_axis_limit / num_intervals
-                if interval >= 1: final_ticks = np.arange(0, x_axis_limit + 1, interval); break
-        if final_ticks is None: final_ticks = np.round(np.linspace(0, x_axis_limit, num=6))
-        ax.set_xticks(np.unique(final_ticks.astype(int)))
+    def _plot_fit(self, x, y, grid, pred, batch, dataset, model, metrics, d50):
+        eq, color = MODELS[model][1:]
+        last = x.max()
+        limit = np.ceil(1.25 * last / 5) * 5
+        if np.isfinite(d50): limit = max(limit, np.ceil(d50 / 5) * 5)  # always show the data and the crossing
+        keep = grid <= limit
+        g, p = grid[keep], pred[keep]
+        k = np.searchsorted(g, last, side='right')
 
-        ax.text(0.02, 0.98, self._get_equation_text(model_name, metrics), transform=ax.transAxes, fontsize=10, va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        
-        plt.tight_layout()
-        safe_batch_name = ''.join(c for c in batch if c.isalnum() or c in ' _').rstrip()
-        safe_dataset_name = ''.join(c for c in dataset_name if c.isalnum()).rstrip()
-        filepath = os.path.join(self.graphs_dir, f"{safe_batch_name}_{safe_dataset_name}_{model_name}_model.png")
-        plt.savefig(filepath, dpi=300, bbox_inches='tight'); plt.close()
-        print(f"    Plot saved: {os.path.basename(filepath)}")
+        fig, ax = plt.subplots(figsize=(12, 8))
+        try:
+            ax.scatter(x, y, color='red', s=50, zorder=5, label='Actual Data')
+            ax.plot(g[:k], p[:k], color=color, linewidth=2.5, label=f"{model} Model (R² = {metrics['r2']:.4f})")
+            ax.plot(g[max(k - 1, 0):], p[max(k - 1, 0):], color=color, linewidth=2.5, linestyle='--')
+            ax.axvline(last, color='gray', linestyle=':', linewidth=2, label=f'End of Actual Data ({last:.0f} days)')
+            ax.axhline(THRESHOLD, color='black', linestyle='--', alpha=0.7, label='50% Degradation Threshold')
+            if np.isfinite(d50):
+                ax.axvline(d50, color='orange', linestyle=':', alpha=0.8)
+                right = d50 > limit / 2  # put the label on the side of the line that has room
+                ax.text(d50 + (-0.01 if right else 0.01) * limit, 45, f'{d50:.1f} days', fontweight='bold',
+                        rotation=90, ha='right' if right else 'left')
+            ax.set(title=f"{batch} | {dataset}\n{model} Model Extrapolation", xlabel='Time (Days)',
+                   ylabel='Degradation (%)', ylim=(0, 105), xlim=(0, limit))
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
+            ax.legend(loc='best')
+            ax.text(0.02, 0.98, f"Model: {eq}\nR² = {metrics['r2']:.4f}\nRMSE = {metrics['rmse']:.4f}",
+                    transform=ax.transAxes, va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            fig.tight_layout()
+            name = f"{_safe(batch, ' _')}_{_safe(dataset)}_{model}_model.png"
+            fig.savefig(os.path.join(self.graphs_dir, name), dpi=300, bbox_inches='tight')
+        finally:
+            plt.close(fig)
+        print(f"    Plot saved: {name}")
 
     def create_summary_tables(self):
-        print(f"\n{'='*80}\nDEGRADATION ANALYSIS SUMMARY\n{'='*80}")
-        for dataset_name, models_data in self.all_models.items():
-            print(f"\nSUMMARY FOR: '{dataset_name}'\n{'-'*60}")
-            
-            for model_type in self.selected_models:
-                print(f"\n--- {model_type.upper()} MODEL RESULTS ---")
-                results_data = []
+        print(f"\n{RULE}\nDEGRADATION ANALYSIS SUMMARY\n{RULE}")
+        for dataset, models_data in self.all_models.items():
+            print(f"\nSUMMARY FOR: '{dataset}'")
+            for model in self.selected_models:
+                print(f"\n{model.upper()} MODEL RESULTS")
+                rows = []
                 for batch in self.batches:
-                    model_info = models_data.get(batch, {}).get(model_type, {})
-                    metrics = model_info.get('metrics', {})
-                    row = {"Batch": batch, "Days to 50%": model_info.get('days_to_50', 'N/A'),
-                           "R²": metrics.get('r2', 'N/A'), "RMSE": metrics.get('rmse', 'N/A')}
-                    results_data.append(row)
-                
-                results_df = pd.DataFrame(results_data)
-                for col in ['R²', 'RMSE']: results_df[col] = pd.to_numeric(results_df[col], errors='coerce').map('{:.4f}'.format)
-                print(results_df.to_string(index=False))
-                safe_name = ''.join(c for c in dataset_name if c.isalnum()).rstrip()
-                results_df.to_csv(os.path.join(self.results_dir, f'summary_{safe_name}_{model_type}.csv'), index=False)
-            print(f"Results for '{dataset_name}' saved to CSV files.")
+                    info = models_data.get(batch, {}).get(model)
+                    rows.append({'Batch': batch, 'Days to 50%': _fmt_days(info, 4),
+                                 'R²': _fmt_metric(info, 'r2'), 'RMSE': _fmt_metric(info, 'rmse')})
+                table = pd.DataFrame(rows)
+                print(table.to_string(index=False))
+                table.to_csv(os.path.join(self.results_dir, f'summary_{_safe(dataset)}_{model}.csv'), index=False)
+            print(f"Results for '{dataset}' saved to CSV files.")
 
     def create_performance_heatmaps(self):
-        print(f"\n{'='*60}\nCREATING PERFORMANCE HEATMAPS\n{'='*60}")
-        for dataset_name, models_data in self.all_models.items():
-            metrics_data = {
-                'R²': np.full((len(self.selected_models), len(self.batches)), np.nan),
-                'RMSE': np.full((len(self.selected_models), len(self.batches)), np.nan)
-            }
-            for i, model_name in enumerate(self.selected_models):
-                for j, batch_name in enumerate(self.batches):
-                    metrics = models_data.get(batch_name, {}).get(model_name, {}).get('metrics')
-                    if metrics:
-                        metrics_data['R²'][i, j] = metrics.get('r2')
-                        metrics_data['RMSE'][i, j] = metrics.get('rmse')
-            
-            safe_name = ''.join(c for c in dataset_name if c.isalnum()).rstrip()
-            self._plot_heatmap(metrics_data['R²'], f'{dataset_name}\n$R^2$ Performance', f'heatmap_{safe_name}_R2.png')
-            self._plot_heatmap(metrics_data['RMSE'], f'{dataset_name}\nRMSE Performance', f'heatmap_{safe_name}_RMSE.png', cmap=plt.cm.RdYlGn_r)
+        print(f"\n{RULE}\nCREATING PERFORMANCE HEATMAPS\n{RULE}")
+        for dataset, models_data in self.all_models.items():
+            shape = (len(self.selected_models), len(self.batches))
+            r2, rmse = np.full(shape, np.nan), np.full(shape, np.nan)
+            for i, model in enumerate(self.selected_models):
+                for j, batch in enumerate(self.batches):
+                    info = models_data.get(batch, {}).get(model)
+                    if info: r2[i, j], rmse[i, j] = info['metrics']['r2'], info['metrics']['rmse']
+            safe = _safe(dataset)
+            self._plot_heatmap(r2, f'{dataset}\nR² Performance', f'heatmap_{safe}_R2.png')
+            self._plot_heatmap(rmse, f'{dataset}\nRMSE Performance', f'heatmap_{safe}_RMSE.png', cmap='RdYlGn_r')
 
-    def _plot_heatmap(self, data, title, filename, cmap=plt.cm.RdYlGn):
+    def _plot_heatmap(self, data, title, filename, cmap='RdYlGn'):
         fig, ax = plt.subplots(figsize=(10, 5))
-        if np.isnan(data).all():
-            ax.text(0.5, 0.5, 'No data available', ha='center', va='center'); ax.set_xticks([]); ax.set_yticks([])
-            plt.savefig(os.path.join(self.graphs_dir, filename), dpi=300); plt.close()
-            return
-
-        ax.imshow(data, cmap=cmap, aspect='auto')
-        ax.set(xticks=np.arange(len(self.batches)), yticks=np.arange(len(self.selected_models)),
-               xticklabels=self.batches, yticklabels=self.selected_models, title=title)
-        ax.set_xlabel('Batches', fontsize=14, fontweight='bold', labelpad=15)
-        ax.set_ylabel('Models', fontsize=14, fontweight='bold', labelpad=15)
-        plt.setp(ax.get_xticklabels(), rotation=15, ha="right", rotation_mode="anchor")
-
-        for i in range(len(self.selected_models)):
-            for j in range(len(self.batches)):
-                if not np.isnan(data[i, j]):
-                    ax.text(j, i, f'{data[i, j]:.3f}', ha="center", va="center", color="black", fontsize=16)
-
-        # --- RESTORED GRIDLINES ---
-        ax.set_xticks(np.arange(data.shape[1]+1)-.5, minor=True)
-        ax.set_yticks(np.arange(data.shape[0]+1)-.5, minor=True)
-        ax.grid(which="minor", color='black', linestyle='-', linewidth=2)
-        ax.tick_params(which="minor", bottom=False, left=False)
-        # --- END OF FIX ---
-
-        fig.tight_layout()
-        plt.savefig(os.path.join(self.graphs_dir, filename), dpi=300); plt.close()
+        try:
+            if np.isnan(data).all():
+                ax.text(0.5, 0.5, 'No data available', ha='center', va='center')
+                ax.set(xticks=[], yticks=[], title=title)
+            else:
+                ax.imshow(data, cmap=cmap, aspect='auto')
+                ax.set(xticks=np.arange(len(self.batches)), yticks=np.arange(len(self.selected_models)),
+                       xticklabels=self.batches, yticklabels=self.selected_models, title=title,
+                       xlabel='Batches', ylabel='Models')
+                ax.xaxis.labelpad = ax.yaxis.labelpad = 15
+                plt.setp(ax.get_xticklabels(), rotation=15, ha='right', rotation_mode='anchor')
+                for (i, j), v in np.ndenumerate(data):
+                    if not np.isnan(v): ax.text(j, i, f'{v:.3f}', ha='center', va='center', fontsize=16)
+                ax.set_xticks(np.arange(data.shape[1] + 1) - .5, minor=True)  # cell borders
+                ax.set_yticks(np.arange(data.shape[0] + 1) - .5, minor=True)
+                ax.grid(which='minor', color='black', linestyle='-', linewidth=2)
+                ax.tick_params(which='minor', bottom=False, left=False)
+            fig.tight_layout()
+            fig.savefig(os.path.join(self.graphs_dir, filename), dpi=300)
+        finally:
+            plt.close(fig)
         print(f"Heatmap saved: {filename}")
 
     def generate_detailed_report(self):
-        report_path = os.path.join(self.results_dir, "degradation_analysis_report.txt")
-        with open(report_path, 'w') as f:
-            f.write("DEGRADATION ANALYSIS COMPREHENSIVE REPORT\n" + "="*60 + "\n")
-            for dataset_name, models in self.all_models.items():
-                df_ = self.dataframes[dataset_name]
-                f.write(f"\n\n{'='*60}\nANALYSIS FOR DATASET: '{dataset_name}'\n{'='*60}\n")
-                f.write(f"  Data Summary:\n  Data points: {len(df_)}\n  Time range: {df_['Day'].min():.1f} - {df_['Day'].max():.1f} days\n\n")
-                f.write("DETAILED RESULTS BY BATCH:\n" + "="*40 + "\n")
+        report_path = os.path.join(self.results_dir, 'degradation_analysis_report.txt')
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(f"DEGRADATION ANALYSIS COMPREHENSIVE REPORT\n{RULE}\n")
+            for dataset, models in self.all_models.items():
+                df = self.dataframes[dataset]
+                f.write(f"\n\n{RULE}\nANALYSIS FOR DATASET: '{dataset}'\n{RULE}\n")
+                f.write(f"  Data Summary:\n  Data points: {len(df)}\n"
+                        f"  Time range: {df['Day'].min():.1f} - {df['Day'].max():.1f} days\n\n")
+                f.write(f"DETAILED RESULTS BY BATCH:\n{'=' * 40}\n")
                 for batch in self.batches:
-                    f.write(f"\n{batch}:\n" + "-"*len(batch) + "-\n")
+                    f.write(f"\n{batch}:\n{'_' * (len(batch) + 1)}\n")
                     batch_models = models.get(batch, {})
-                    if batch_models:
-                        for name in self.selected_models:
-                            if name in batch_models:
-                                data = batch_models[name]
-                                days_str = f"{data['days_to_50']:.2f}" if isinstance(data['days_to_50'], float) else data['days_to_50']
-                                m = data['metrics']
-                                f.write(f"    {name:<12}: R²={m['r2']:.4f}, RMSE={m['rmse']:.4f}, Days to 50% = {days_str}\n")
-                    else: f.write("    No valid models created for this batch.\n")
+                    if not batch_models:
+                        f.write("    No valid models created for this batch.\n"); continue
+                    for name in self.selected_models:
+                        if name in batch_models:
+                            data = batch_models[name]
+                            f.write(f"    {name:<12}: R²={data['metrics']['r2']:.4f}, "
+                                    f"RMSE={data['metrics']['rmse']:.4f}, Days to 50% = {_fmt_days(data)}\n")
         print(f"Detailed report saved to: {report_path}")
 
     def run_complete_analysis(self):
         print("\n🚀 Starting complete degradation analysis workflow...")
-        try:
-            for dataset_info in self.datasets_config:
-                self._create_models_for_dataset(dataset_info)
-            self.create_summary_tables()
-            self.create_performance_heatmaps()
-            self.generate_detailed_report()
-            print(f"\n{'='*60}\n✅ ANALYSIS COMPLETED SUCCESSFULLY!\n{'='*60}")
-        except Exception as e:
-            print(f"\n❌ ERROR DURING ANALYSIS: {e}"); import traceback; traceback.print_exc()
+        for info in self.datasets_config:
+            self._create_models_for_dataset(info)  # errors reach main, so success prints only on success
+        self.create_summary_tables()
+        self.create_performance_heatmaps()
+        self.generate_detailed_report()
+        print(f"\n{RULE}\n✅ ANALYSIS COMPLETED SUCCESSFULLY!\n{RULE}")
+
 
 def main():
-    print("="*60 + "\nDEGRADATION ANALYSIS & EXTRAPOLATION TOOL\n" + "="*60)
+    print(f"{RULE}\nDEGRADATION ANALYSIS & EXTRAPOLATION TOOL\n{RULE}")
     datasets_config = []
-    
+
     while True:
         try:
             num_datasets = int(input("Enter the number of datasets to analyze (1-10): "))
             if 1 <= num_datasets <= 10: break
-            else: print("Error: Please enter a number between 1 and 10.")
-        except ValueError: print("Error: Invalid input. Please enter a whole number.")
+            print("Error: Please enter a number between 1 and 10.")
+        except ValueError:
+            print("Error: Invalid input. Please enter a whole number.")
 
     for i in range(num_datasets):
-        print(f"\n--- Configuring Dataset {i+1} ---")
-        name = input(f"Enter a descriptive name for this dataset: ").strip()
+        print(f"\nConfiguring Dataset {i + 1}")
+        name = input("Enter a descriptive name for this dataset: ").strip()
         while True:
             path = input(f"Enter the full path to the Excel file for '{name}': ").strip().strip('"')
-            if os.path.exists(path): datasets_config.append({'name': name, 'path': path}); break
-            else: print(f"❌ File not found at '{path}'. Please try again.")
+            if os.path.isfile(path):
+                datasets_config.append({'name': name, 'path': path}); break
+            print(f"❌ File not found at '{path}'. Please try again.")
 
-    available_models = ['Linear', 'Logarithmic', 'Power Law', 'Exponential']
-    selected_model_names = []
-    print("\n" + "="*60 + "\nMODEL SELECTION\n" + "="*60)
-    print("Please select the models you want to run:")
+    available_models = list(MODELS)
+    all_choice = str(len(available_models) + 1)
+    print(f"\n{RULE}\nMODEL SELECTION\n{RULE}\nPlease select the models you want to run:")
     for i, model in enumerate(available_models):
-        print(f"  {i+1}: {model}")
-    print("  5: All")
-    
+        print(f"  {i + 1}: {model}")
+    print(f"  {all_choice}: All")
+
     while True:
         choice = input("Enter your choice(s) (e.g., '1', '2,4', or 'all'): ").lower().strip()
-        if choice == 'all' or choice == '5':
-            selected_model_names = available_models
+        if choice in ('all', all_choice):
+            selected = available_models
             break
         try:
-            indices = [int(i.strip()) - 1 for i in choice.split(',')]
-            if all(0 <= index < len(available_models) for index in indices):
-                selected_model_names = [available_models[i] for i in sorted(list(set(indices)))]
-                break
-            else: print("Error: One or more numbers are out of the valid range (1-4).")
+            indices = {int(i) - 1 for i in choice.split(',')}
         except ValueError:
-            print("Error: Invalid input. Please enter numbers separated by commas, or 'all'.")
+            print("Error: Invalid input. Please enter numbers separated by commas, or 'all'."); continue
+        if all(0 <= i < len(available_models) for i in indices):
+            selected = [available_models[i] for i in sorted(indices)]
+            break
+        print(f"Error: One or more numbers are out of the valid range (1-{len(available_models)}).")
 
-    print(f"\nModels selected for analysis: {', '.join(selected_model_names)}")
-    
+    print(f"\nModels selected for analysis: {', '.join(selected)}")
     try:
-        analysis = DegradationAnalysis(datasets_config, selected_model_names)
-        analysis.run_complete_analysis()
-        print(f"\n🎉 Analysis complete! Check the 'graphs' and 'results' folders.")
-    except (FileNotFoundError, ValueError, KeyError, IOError) as e:
+        DegradationAnalysis(datasets_config, selected).run_complete_analysis()
+        print("\n🎉 Analysis complete! Check the 'graphs' and 'results' folders.")
+    except (OSError, ValueError) as e:
         print(f"\n❌ A configuration or data error occurred: {e}")
     except Exception as e:
         print(f"\n❌ An unexpected error occurred: {e}")
+        traceback.print_exc()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
